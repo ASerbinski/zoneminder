@@ -277,8 +277,11 @@ Monitor::Monitor(
   Rgb p_signal_check_colour,
   bool p_embed_exif,
   Purpose p_purpose,
+  unsigned int ps_width,
+  unsigned int ps_height,
   int p_n_zones,
   Zone *p_zones[]
+  
 ) : id( p_id ),
   server_id( p_server_id ),
   function( (Function)p_function ),
@@ -319,9 +322,12 @@ Monitor::Monitor(
   camera( p_camera ),
   n_zones( p_n_zones ),
   zones( p_zones ),
+  s_width( ps_width ),
+  s_height( ps_height), 
   timestamps( 0 ),
   images( 0 ),
   privacy_bitmask( NULL )
+  
 {
   strncpy( name, p_name, sizeof(name)-1 );
 
@@ -368,12 +374,14 @@ Monitor::Monitor(
     event_close_mode = CLOSE_IDLE;
 
   Debug( 1, "monitor purpose=%d", purpose );
-
+  
   mem_size = sizeof(SharedData)
        + sizeof(TriggerData)
        + sizeof(VideoStoreData) //Information to pass back to the capture process
        + (image_buffer_count*sizeof(struct timeval))
        + (image_buffer_count*camera->ImageSize())
+       + (image_buffer_count*40  ) //mvect buffer size, only holds alarm_pixels now
+       + (image_buffer_count*((width*height))) //JPEG buffer size
        + 64; /* Padding used to permit aligning the images buffer to 64 byte boundary */
 
   Debug( 1, "mem.size=%d", mem_size );
@@ -544,11 +552,17 @@ bool Monitor::connect() {
     exit( -1 );
   }
 #endif // ZM_MEM_MAPPED
+
+  int mv_buffer_size = 40;
+  int j_buffer_size = (width*height);
+
   shared_data = (SharedData *)mem_ptr;
   trigger_data = (TriggerData *)((char *)shared_data + sizeof(SharedData));
   video_store_data = (VideoStoreData *)((char *)trigger_data + sizeof(TriggerData));
   struct timeval *shared_timestamps = (struct timeval *)((char *)video_store_data + sizeof(VideoStoreData));
   unsigned char *shared_images = (unsigned char *)((char *)shared_timestamps + (image_buffer_count*sizeof(struct timeval)));
+  uint8_t *shared_mbuff = (uint8_t *)((char *)shared_images +  (image_buffer_count*camera->ImageSize()));
+  uint8_t *shared_jbuff = (uint8_t *)((char *)shared_mbuff +  (image_buffer_count*mv_buffer_size));
   
   if(((unsigned long)shared_images % 64) != 0) {
     /* Align images buffer to nearest 64 byte boundary */
@@ -556,9 +570,14 @@ bool Monitor::connect() {
     shared_images = (uint8_t*)((unsigned long)shared_images + (64 - ((unsigned long)shared_images % 64)));
   }
   image_buffer = new Snapshot[image_buffer_count];
+
+
+ 
   for ( int i = 0; i < image_buffer_count; i++ ) {
     image_buffer[i].timestamp = &(shared_timestamps[i]);
     image_buffer[i].image = new Image( width, height, camera->Colours(), camera->SubpixelOrder(), &(shared_images[i*camera->ImageSize()]) );
+    image_buffer[i].image->VectBuffer() = &(shared_mbuff[ i*mv_buffer_size ]) ; //FIXMEC maybe needs to be a parameter to constructor in line above
+    image_buffer[i].image->JPEGBuffer(width, height) = &(shared_jbuff[ i*j_buffer_size ]) ; //FIXMEC maybe needs to be a parameter to constructor in line above
     image_buffer[i].image->HoldBuffer(true); /* Don't release the internal buffer or replace it with another */
   }
   if ( (deinterlacing & 0xff) == 4) {
@@ -607,6 +626,10 @@ Monitor::~Monitor() {
       delete next_buffer.timestamp;
     }
     for ( int i = 0; i < image_buffer_count; i++ ) {
+         if (function == MVDECT) {
+          while (*(image_buffer[i].image->VectBuffer()) != 0)
+            usleep(1000);
+           }
       delete image_buffer[i].image;
     }
     delete[] image_buffer;
@@ -1141,6 +1164,8 @@ bool Monitor::CheckSignal( const Image *image ) {
 }
 
 bool Monitor::Analyse() {
+  if (zm_terminate)  
+       return -1;    
   if ( shared_data->last_read_index == shared_data->last_write_index ) {
     // I wonder how often this happens. Maybe if this happens we should sleep or something?
     return( false );
@@ -1283,12 +1308,17 @@ bool Monitor::Analyse() {
           shared_data->active = signal;
           ref_image = *snap_image;
 
-        } else if ( signal && Active() && (function == MODECT || function == MOCORD) ) {
+
+        } else if ( signal && Active() && (function == MODECT || function == MOCORD || function == MVDECT ) ) {
           Event::StringSet zoneSet;
           int motion_score = last_motion_score;
           if ( !(image_count % (motion_frame_skip+1) ) ) {
             // Get new score.
-            motion_score = last_motion_score = DetectMotion( *snap_image, zoneSet );
+              if (function == MVDECT )
+                  motion_score = last_motion_score = DetectMotion( *snap_image, zoneSet, MVDECT );
+              else 
+                  motion_score = last_motion_score = DetectMotion( *snap_image, zoneSet, MODECT );
+
           }
           //int motion_score = DetectBlack( *snap_image, zoneSet );
           if ( motion_score ) {
@@ -1329,6 +1359,7 @@ bool Monitor::Analyse() {
           if ( noteSet.size() > 0 )
             noteSetMap[LINKED_CAUSE] = noteSet;
         }
+
         //TODO: What happens is the event closes and sets recording to false then recording to true again so quickly that our capture daemon never picks it up. Maybe need a refresh flag?
         if ( (!signal_change && signal) && (function == RECORD || function == MOCORD) ) {
           if ( event ) {
@@ -1595,7 +1626,9 @@ bool Monitor::Analyse() {
       last_section_mod = 0;
     } // end if ( trigger_data->trigger_state != TRIGGER_OFF )
 
-    if ( (!signal_change && signal) && (function == MODECT || function == MOCORD) ) {
+    //if ( (!signal_change && signal) && (function == MODECT || function == MOCORD || function == MVDECT ) ) {
+    if ( (!signal_change && signal) && (function == MODECT || function == MOCORD ) ) {
+
       if ( state == ALARM ) {
          ref_image.Blend( *snap_image, alarm_ref_blend_perc );
       } else {
@@ -2406,7 +2439,170 @@ int Monitor::LoadFfmpegMonitors( const char *file, Monitor **&monitors, Purpose 
       hue,
       colour,
       purpose==CAPTURE,
-      record_audio
+      record_audio,
+      FfmpegCamera::software,
+      (Monitor::Function)function
+    );
+
+    monitors[i] = new Monitor(
+      id,
+      name,
+      server_id,
+      function,
+      enabled,
+      linked_monitors,
+      camera,
+      orientation,
+      deinterlacing,
+      savejpegs,
+      videowriter,
+      encoderparams,
+      record_audio,
+      event_prefix,
+      label_format,
+      Coord( label_x, label_y ),
+      label_size,
+      image_buffer_count,
+      warmup_count,
+      pre_event_count,
+      post_event_count,
+      stream_replay_buffer,
+      alarm_frame_count,
+      section_length,
+      frame_skip,
+      motion_frame_skip,
+      analysis_fps,
+      analysis_update_delay,
+      capture_delay,
+      alarm_capture_delay,
+      fps_report_interval,
+      ref_blend_perc,
+      alarm_ref_blend_perc,
+      track_motion,
+      embed_exif,
+      RGB_WHITE,
+      purpose,
+      0,
+      0
+    );
+    camera->setMonitor( monitors[i] );
+    Zone **zones = 0;
+    int n_zones = Zone::Load( monitors[i], zones );
+    monitors[i]->AddZones( n_zones, zones );
+    monitors[i]->AddPrivacyBitmask( zones );
+    Debug( 1, "Loaded monitor %d(%s), %d zones", id, name, n_zones );
+  }
+  if ( mysql_errno( &dbconn ) ) {
+    Error( "Can't fetch row: %s", mysql_error( &dbconn ) );
+    exit( mysql_errno( &dbconn ) );
+  }
+  // Yadda yadda
+  mysql_free_result( result );
+
+  return( n_monitors );
+}
+
+int Monitor::LoadFfmpegMonitorsHW( const char *file, Monitor **&monitors, Purpose purpose ) {
+    std::string sql = "select Id, Name, ServerId, Function+0, Enabled, LinkedMonitors, Path, Method, Options, Width, Height, Colours, Palette, Orientation+0, Deinterlacing, SaveJPEGs, VideoWriter, EncoderParameters, RecordAudio, Brightness, Contrast, Hue, Colour, EventPrefix, LabelFormat, LabelX, LabelY, LabelSize, ImageBufferCount, WarmupCount, PreEventCount, PostEventCount, StreamReplayBuffer, AlarmFrameCount, SectionLength, FrameSkip, MotionFrameSkip, AnalysisFPS, AnalysisUpdateDelay, MaxFPS, AlarmMaxFPS, FPSReportInterval, RefBlendPerc, AlarmRefBlendPerc, TrackMotion, Exif from Monitors where Function != 'None' and Type = 'Ffmpeghw'";
+  if ( file[0] ) {
+    sql += " AND Path = '";
+    sql += file;
+    sql += "'";
+  }
+  if ( staticConfig.SERVER_ID ) {
+    sql += stringtf( " AND ServerId=%d", staticConfig.SERVER_ID );
+  }
+  Debug( 1, "Loading FFMPEG HW Monitors with %s", sql.c_str() );
+  MYSQL_RES *result = zmDbFetch( sql.c_str() );
+  if ( ! result ) {
+    Error( "Cannot load FfmpegMonitorsHW" );
+    exit( mysql_errno( &dbconn ) );
+  }
+
+  int n_monitors = mysql_num_rows( result );
+  Debug( 1, "Got %d monitors", n_monitors );
+  delete[] monitors;
+  monitors = new Monitor *[n_monitors];
+  for( int i = 0; MYSQL_ROW dbrow = mysql_fetch_row( result ); i++ ) {
+    int col = 0;
+
+    int id = atoi(dbrow[col]); col++;
+    const char *name = dbrow[col]; col++;
+    unsigned int server_id = dbrow[col] ? atoi(dbrow[col]) : 0; col++;
+    int function = atoi(dbrow[col]); col++;
+    int enabled = atoi(dbrow[col]); col++;
+    const char *linked_monitors = dbrow[col] ? dbrow[col] : ""; col++;
+
+    const char *path = dbrow[col]; col++;
+    const char *method = dbrow[col]; col++;
+    const char *options = dbrow[col] ? dbrow[col] : ""; col++;
+
+    int width = atoi(dbrow[col]); col++;
+    int height = atoi(dbrow[col]); col++;
+    
+
+
+    int colours = atoi(dbrow[col]); col++;
+    /* int palette = atoi(dbrow[col]); */ col++;
+    Orientation orientation = (Orientation)atoi(dbrow[col]); col++;
+    unsigned int deinterlacing = atoi(dbrow[col]); col++;
+
+    int savejpegs = atoi(dbrow[col]); col++;
+    VideoWriter videowriter = (VideoWriter)atoi(dbrow[col]); col++;
+    std::string encoderparams =  dbrow[col] ? dbrow[col] : ""; col++;
+    bool record_audio = (*dbrow[col] != '0'); col++;
+
+    int brightness = atoi(dbrow[col]); col++;
+    int contrast = atoi(dbrow[col]); col++;
+    int hue = atoi(dbrow[col]); col++;
+    int colour = atoi(dbrow[col]); col++;
+
+    const char *event_prefix = dbrow[col] ? dbrow[col] : ""; col++;
+    const char *label_format = dbrow[col] ? dbrow[col] : ""; col++;
+
+    int label_x = atoi(dbrow[col]); col++;
+    int label_y = atoi(dbrow[col]); col++;
+    int label_size = atoi(dbrow[col]); col++;
+
+    int image_buffer_count = atoi(dbrow[col]); col++;
+    int warmup_count = atoi(dbrow[col]); col++;
+    int pre_event_count = atoi(dbrow[col]); col++;
+    int post_event_count = atoi(dbrow[col]); col++;
+    int stream_replay_buffer = atoi(dbrow[col]); col++;
+    int alarm_frame_count = atoi(dbrow[col]); col++;
+    int section_length = atoi(dbrow[col]); col++;
+    int frame_skip = atoi(dbrow[col]); col++;
+    int motion_frame_skip = atoi(dbrow[col]); col++;
+
+    double analysis_fps = dbrow[col] ? strtod(dbrow[col], NULL) : 0; col++;
+    unsigned int analysis_update_delay = strtoul(dbrow[col++], NULL, 0);
+    double capture_fps = dbrow[col] ? atof(dbrow[col]) : 0;col++;
+    int capture_delay = capture_fps >0.0 ?int(DT_PREC_3/capture_fps):0; 
+    double alarm_capture_fps = dbrow[col] ? atof(dbrow[col]) : 0; col++;
+    int alarm_capture_delay = alarm_capture_fps > 0.0 ?int(DT_PREC_3/alarm_capture_fps):0;
+
+    int fps_report_interval = atoi(dbrow[col]); col++;
+    int ref_blend_perc = atoi(dbrow[col]); col++;
+    int alarm_ref_blend_perc = atoi(dbrow[col]); col++;
+    int track_motion = atoi(dbrow[col]); col++;
+    bool embed_exif = (*dbrow[col] != '0'); col++;
+
+    Camera *camera = new FfmpegCamera(
+      id,
+      path, // File
+      method,
+      options,
+      width,
+      height,
+      colours,
+      brightness,
+      contrast,
+      hue,
+      colour,
+      purpose==CAPTURE,
+      record_audio,
+      FfmpegCamera::hardware,
+      (Monitor::Function)function
     );
 
     monitors[i] = new Monitor(
@@ -2521,6 +2717,10 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
 
   int width = atoi(dbrow[col]); col++;
   int height = atoi(dbrow[col]); col++;
+  
+  unsigned int    s_width=width;
+  unsigned int    s_height=height;
+  
   int colours = atoi(dbrow[col]); col++;
   int palette = atoi(dbrow[col]); col++;
   Orientation orientation = (Orientation)atoi(dbrow[col]); col++;
@@ -2669,8 +2869,42 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
       hue,
       colour,
       purpose==CAPTURE,
-      record_audio
+      record_audio,
+      FfmpegCamera::software,
+      (Monitor::Function)function
     );
+#else // HAVE_LIBAVFORMAT
+    Fatal( "You must have ffmpeg libraries installed to use ffmpeg cameras for monitor %d", id );
+#endif    
+  } else if ( type == "Ffmpeghw" ) {
+#if HAVE_LIBAVFORMAT    
+  
+#ifdef __arm__  
+    // Adjust the input resolution to 360. 
+    s_width=width;
+    s_height=height;
+    width=640;
+    height=360;
+#endif        
+
+    
+    camera = new FfmpegCamera(
+      id,
+      path.c_str(),
+      method,
+      options,
+      width,
+      height,
+      colours,
+      brightness,
+      contrast,
+      hue,
+      colour,
+      purpose==CAPTURE,
+      record_audio,
+      FfmpegCamera::hardware,
+      (Monitor::Function)function
+     );
 #else // HAVE_LIBAVFORMAT
     Fatal( "You must have ffmpeg libraries installed to use ffmpeg cameras for monitor %d", id );
 #endif // HAVE_LIBAVFORMAT
@@ -2717,6 +2951,7 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
   } else {
     Fatal( "Bogus monitor type '%s' for monitor %d", type.c_str(), id );
   }
+  
   monitor = new Monitor(
     id,
     name.c_str(),
@@ -2755,9 +2990,10 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
     signal_check_colour,
     embed_exif,
     purpose,
+    s_width,
+    s_height, 
     0,
     0
-
   );
 
   camera->setMonitor( monitor );
@@ -2769,6 +3005,8 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
     monitor->AddPrivacyBitmask( zones );
   }
   Debug( 1, "Loaded monitor %d(%s), %d zones", id, name.c_str(), n_zones );
+  
+  
   return( monitor );
 }
 
@@ -2776,6 +3014,8 @@ Monitor *Monitor::Load( unsigned int p_id, bool load_zones, Purpose purpose ) {
  * Returns -1 on failure.
  */
 int Monitor::Capture() {
+    if (zm_terminate)  
+       return -1;     
   static int FirstCapture = 1; // Used in de-interlacing to indicate whether this is the even or odd image
   int captureResult;
 
@@ -2982,9 +3222,11 @@ bool Monitor::closeEvent() {
   return( false );
 }
 
-unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &zoneSet ) {
+unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &zoneSet , Function function) {
   bool alarm = false;
   unsigned int score = 0;
+  uint8_t* mvect_buffer=NULL;
+  int check_result=0;
 
   if ( n_zones <= 0 ) return( alarm );
 
@@ -2996,7 +3238,11 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
     ref_image.WriteJpeg( diag_path );
   }
 
-  ref_image.Delta( comp_image, &delta_image);
+  if (function == MVDECT ) {
+    mvect_buffer=const_cast<Image*>(&comp_image)->VectBuffer(); 
+  } else
+    ref_image.Delta( comp_image, &delta_image);
+
 
   if ( config.record_diag_images ) {
     static char diag_path[PATH_MAX] = "";
@@ -3016,7 +3262,10 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
       continue;
     }
     Debug( 3, "Blanking inactive zone %s", zone->Label() );
-    delta_image.Fill( RGB_BLACK, zone->GetPolygon() );
+    if (function == MODECT ) {
+       delta_image.Fill( RGB_BLACK, zone->GetPolygon() );
+    }
+
   }
 
   // Check preclusive zones first
@@ -3028,7 +3277,14 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
     int old_zone_score = zone->Score();
     bool old_zone_alarmed = zone->Alarmed();
     Debug( 3, "Checking preclusive zone %s - old score: %d, state: %s", zone->Label(),old_zone_score, zone->Alarmed()?"alarmed":"quiet" );
-    if ( zone->CheckAlarms( &delta_image ) ) {
+
+    if (function == MVDECT ) {
+        //check_result = zone->CheckAlarms( mvect_buffer, width, height);
+        check_result = zone->CheckAlarms( mvect_buffer, n_zone);
+    }    else 
+        check_result = zone->CheckAlarms( &delta_image);
+    
+    if ( check_result ) {
       alarm = true;
       score += zone->Score();
       zone->SetAlarm();
@@ -3066,7 +3322,14 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
         continue;
       }
       Debug( 3, "Checking active zone %s", zone->Label() );
-      if ( zone->CheckAlarms( &delta_image ) ) {
+
+      if (function == MVDECT ) {
+        //check_result = zone->CheckAlarms( mvect_buffer, width, height );
+        check_result = zone->CheckAlarms( mvect_buffer, n_zone);
+      } else 
+        check_result = zone->CheckAlarms( &delta_image);
+    
+      if ( check_result ) {
         alarm = true;
         score += zone->Score();
         zone->SetAlarm();
@@ -3088,7 +3351,15 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
           continue;
         }
         Debug( 3, "Checking inclusive zone %s", zone->Label() );
-        if ( zone->CheckAlarms( &delta_image ) ) {
+
+        if (function == MVDECT ) {
+          //check_result = zone->CheckAlarms( mvect_buffer, width, height );
+          check_result = zone->CheckAlarms( mvect_buffer, n_zone);
+        } else 
+          check_result = zone->CheckAlarms( &delta_image);
+    
+        if ( check_result ) {    
+
           alarm = true;
           score += zone->Score();
           zone->SetAlarm();
@@ -3110,7 +3381,14 @@ unsigned int Monitor::DetectMotion( const Image &comp_image, Event::StringSet &z
           continue;
         }
         Debug( 3, "Checking exclusive zone %s", zone->Label() );
-        if ( zone->CheckAlarms( &delta_image ) ) {
+
+        if (function == MVDECT ) {
+          //check_result = zone->CheckAlarms( mvect_buffer, width, height );
+          check_result = zone->CheckAlarms( mvect_buffer, n_zone);
+        } else 
+          check_result = zone->CheckAlarms( &delta_image);
+    
+        if ( check_result ) {      
           alarm = true;
           score += zone->Score();
           zone->SetAlarm();
@@ -3189,10 +3467,11 @@ bool Monitor::DumpSettings( char *output, bool verbose ) {
     function==NONE?"None":(
     function==MONITOR?"Monitor Only":(
     function==MODECT?"Motion Detection":(
+    function==MVDECT?"Motion Detection by Vectors":(
     function==RECORD?"Continuous Record":(
     function==MOCORD?"Continuous Record with Motion Detection":(
     function==NODECT?"Externally Triggered only, no Motion Detection":"Unknown"
-  ))))));
+  )))))));
   sprintf( output+strlen(output), "Zones : %d\n", n_zones );
   for ( int i = 0; i < n_zones; i++ ) {
     zones[i]->DumpSettings( output+strlen(output), verbose );
@@ -3602,6 +3881,7 @@ bool MonitorStream::sendFrame( Image *image, struct timeval *timestamp ) {
   } else
 #endif // HAVE_LIBAVCODEC
   {
+	
     static unsigned char temp_img_buffer[ZM_MAX_IMAGE_SIZE];
 
     int img_buffer_size = 0;
@@ -3995,3 +4275,4 @@ int Monitor::PostCapture() {
   return( camera->PostCapture() );
 }
 Monitor::Orientation Monitor::getOrientation() const { return orientation; }
+

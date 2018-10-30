@@ -116,6 +116,14 @@ void Zone::Setup(
     }
     pg_image->WriteJpeg( diag_path );
   }
+  
+  //Zone motion vector mask setup is now done in zm_ffmpeg_camera.cpp
+  zone_vector_mask=(uint8_t*)zm_mallocaligned(32,zm_size);
+      if(zone_vector_mask == NULL)
+		      Fatal("Memory allocation failed for zone vector mask: %s",strerror(errno));	
+  
+  
+  
 } // end Zone::Setup
 
 Zone::~Zone() {
@@ -123,6 +131,10 @@ Zone::~Zone() {
   delete image;
   delete pg_image;
   delete[] ranges;
+  if (zone_vector_mask) {
+	    zm_freealigned(zone_vector_mask);
+        zone_vector_mask = NULL;
+  }
 }
 
 void Zone::RecordStats( const Event *event ) {
@@ -187,6 +199,111 @@ bool Zone::CheckExtendAlarmCount() {
   }
   return false;
 } // end bool Zone::CheckExtendAlarmCount
+
+void Zone::SetVectorMask() {
+  
+  uint32_t registers=0; 
+  uint32_t offset=0;
+  uint32_t count=0;
+  
+  int frame_width=monitor->Width()+16;
+  int frame_height=((monitor->Height()+16)/16)*16; //Vcos align up
+  
+  numblocks= (frame_width*frame_height)/256;
+  
+  
+  Info("Setting up the motion vector mask with numblocks %d", numblocks);
+    for (uint32_t i=0 ; i< numblocks ; i++) {
+  
+    uint32_t xcoord = (i*16) % (monitor->Width() + 16);  //these blocks are tiled to cover the entire frame and are 16x16 size
+    uint32_t ycoord = ((i*16)/(monitor->Width() +16))*16;
+    
+    //Save the active bits Left to Right instead of Right to Left with each registers valuable
+    //so that the numblocks index can be used to index the corresponding pixel in an RGB buffer
+    if (polygon.isInside(Coord(xcoord,ycoord))) {//coordinates inside polygon 
+           registers =registers | (0x80000000 >> count);
+    }
+    
+    count++;
+    if (( count == 32) || (i == numblocks-1)) {
+      memcpy(zone_vector_mask+offset , &registers, 4 ) ;  
+      count=0;
+      offset+=4;
+      registers=0;
+
+    }
+    
+      
+                             
+}
+ Info("Done setting up zone vector mask");
+
+  
+}	
+
+
+bool Zone::CheckAlarms( uint8_t *& mvect_buffer, int zone_n) { 
+    ResetStats();  
+    alarm_centre=Coord(0,0);
+    
+    if ( overload_count ) {
+    Info( "In overload mode, %d frames of %d remaining", overload_count, overload_frames );
+    Debug( 4, "In overload mode, %d frames of %d remaining", overload_count, overload_frames );
+    overload_count--;
+    return( false );
+  }
+   
+  
+    if (mvect_buffer) {
+      
+      uint16_t offset=4*zone_n;
+      memcpy(&alarm_pixels,mvect_buffer+offset,4);      
+        
+    }   
+    
+    score = ((double) alarm_pixels/(polygon.Area()))*100; 
+    //Info("Motion score %d, alarm pixels %d, min %d, max %d ",  score, alarm_pixels, min_alarm_pixels, max_alarm_pixels);  
+  	  
+    
+    if( score ) {
+      
+      //Info("Motion %d, score %d, min %d, max %d ", vec_count, score, minimum_vector_coverage, maximum_vector_coverage);  
+     if( min_alarm_pixels && (alarm_pixels < (unsigned int)min_alarm_pixels) ) {
+        // Not enough pixels alarmed 
+        return (false);
+	 } else if( max_alarm_pixels && (alarm_pixels > (unsigned int)max_alarm_pixels) ) {
+        // Too many pixels alarmed 
+        overload_count = overload_frames;
+        return (false);
+      }
+
+
+
+    } else {
+      // No pixels 
+      return (false);
+    }
+
+
+ 
+    
+    if ( type == INCLUSIVE ) {
+     score >>= 1;
+    } else if ( type == EXCLUSIVE ) {
+     score <<= 1;
+    }
+    
+     
+    
+    Debug( 5, "Adjusted score is %d", score );
+    
+  	
+    
+    return true; 
+};
+
+
+
 
 bool Zone::CheckAlarms( const Image *delta_image ) {
   ResetStats();
@@ -715,7 +832,9 @@ bool Zone::CheckAlarms( const Image *delta_image ) {
   return( true );
 }
 
-bool Zone::ParsePolygonString( const char *poly_string, Polygon &polygon ) {
+
+bool Zone::ParsePolygonString( const char *poly_string, Polygon &polygon, float xfactor, float yfactor ) {
+
   Debug( 3, "Parsing polygon string '%s'", poly_string );
 
   char *str_ptr = new char[strlen(poly_string)+1];
@@ -766,7 +885,20 @@ bool Zone::ParsePolygonString( const char *poly_string, Polygon &polygon ) {
     else
       break;
   }
+  
+#ifdef __arm__
+Info("Adjusting zone polygons with x factor %.3f and y factor %.3f", xfactor, yfactor);
+  
+     for (int p = 0; p< n_coords; p++) {
+           coords[p].X()/=xfactor;
+           coords[p].Y()/=yfactor;
+           
+     }
+
+#endif  
+  
   polygon = Polygon( n_coords, coords );
+  Info("Polygon area after adjustment %d", polygon.Area());   
 
   Debug( 3, "Successfully parsed polygon string" );
   //printf( "Area: %d\n", pg.Area() );
@@ -812,7 +944,7 @@ bool Zone::ParseZoneString( const char *zone_string, int &zone_id, int &colour, 
   *ws = '\0';
   str = ws+1;
 
-  bool result = ParsePolygonString( str, polygon );
+  bool result = ParsePolygonString( str, polygon, 1, 1 );
 
   //printf( "Area: %d\n", pg.Area() );
   //printf( "Centre: %d,%d\n", pg.Centre().X(), pg.Centre().Y() );
@@ -866,18 +998,44 @@ int Zone::Load( Monitor *monitor, Zone **&zones ) {
 
     /* HTML colour code is actually BGR in memory, we want RGB */
     AlarmRGB = rgb_convert(AlarmRGB, ZM_SUBPIX_ORDER_BGR);
+    
+#ifdef __arm__
+//Scale down the polygon to 640x360
+   float x_rfactor = (float) monitor->S_Width() /640;
+   float y_rfactor = (float) monitor->S_Height()/360;
+
+#endif    
+
 
     Debug( 5, "Parsing polygon %s", Coords );
     Polygon polygon;
-    if ( !ParsePolygonString( Coords, polygon ) ) {
+    if ( !ParsePolygonString( Coords, polygon, x_rfactor, y_rfactor ) ) {
       Error( "Unable to parse polygon string '%s' for zone %d/%s for monitor %s, ignoring", Coords, Id, Name, monitor->Name() );
       n_zones -= 1;
       continue;
     }
+#ifdef __arm__
+   //The min_alarm_pixels and max_alarm_pixels are loaded by the web UI to the db using the nondownscaled resolution
+   //The db value therefore needs to be adjusted down here.
+   
+   //FIXME, would be better to get the Area value of non downscaled frame directly from DB parsing.  
+   if ( monitor->GetFunction() == Monitor::MVDECT ) {
+	   //Min/MaxAlarmPixels are stored in the DB as pixel value computed from non downscaled resolution
+       MinAlarmPixels=(MinAlarmPixels/(float)(monitor->S_Width()*monitor->S_Height()))*polygon.Area();
+       MaxAlarmPixels=(MaxAlarmPixels/(float)(monitor->S_Width()*monitor->S_Height()))*polygon.Area();
+   
+       //Number of macroblocks to comprise minimum blob size
+       //Min/MaxFilterPixels are stored in the DB as pixel value computed from non downscaled resolution, converted to number of 16x16 pixels
+       MinFilterPixels=((MinFilterPixels/(float)(monitor->S_Width()*monitor->S_Height()))*polygon.Area())/256;
+       MaxFilterPixels=((MaxFilterPixels/(float)(monitor->S_Width()*monitor->S_Height()))*polygon.Area())/256;
+   }
+#endif   
+
+
 
     if ( polygon.LoX() < 0 || polygon.HiX() >= (int)monitor->Width() 
         || polygon.LoY() < 0 || polygon.HiY() >= (int)monitor->Height() ) {
-      Error( "Zone %d/%s for monitor %s extends outside of image dimensions, (%d,%d), (%d,%d), ignoring", Id, Name, monitor->Name(), polygon.LoX(), polygon.LoY(), polygon.HiX(), polygon.HiY() );
+      Error( "Zone %d/%s for monitor %s extends outside of image dimensions (%d,%d), at LOW (%d,%d), HI (%d,%d), ignoring", Id, Name, monitor->Name(), (int)monitor->Width(), (int)monitor->Height(), polygon.LoX(), polygon.LoY(), polygon.HiX(), polygon.HiY() );
       n_zones -= 1;
       continue;
     }
@@ -885,12 +1043,17 @@ int Zone::Load( Monitor *monitor, Zone **&zones ) {
     if ( false && !strcmp( Units, "Percent" ) ) {
       MinAlarmPixels = (MinAlarmPixels*polygon.Area())/100;
       MaxAlarmPixels = (MaxAlarmPixels*polygon.Area())/100;
-      MinFilterPixels = (MinFilterPixels*polygon.Area())/100;
-      MaxFilterPixels = (MaxFilterPixels*polygon.Area())/100;
+      
+#ifdef __arm__   
+      if ( monitor->GetFunction() == Monitor::MVDECT ) {   
+          MinFilterPixels = ((MinFilterPixels*polygon.Area())/100)/256; //converted to number of 16x16 blocks of pixels
+          MaxFilterPixels = ((MaxFilterPixels*polygon.Area())/100)/256;
+      }    
+#endif 
       MinBlobPixels = (MinBlobPixels*polygon.Area())/100;
-      MaxBlobPixels = (MaxBlobPixels*polygon.Area())/100;
+      MaxBlobPixels = (MaxBlobPixels*polygon.Area())/100;     
     }
-
+    
     if ( atoi(dbrow[2]) == Zone::INACTIVE ) {
       zones[i] = new Zone( monitor, Id, Name, polygon );
     } else if ( atoi(dbrow[2]) == Zone::PRIVACY ) {

@@ -60,6 +60,7 @@ public:
     NONE=1,
     MONITOR,
     MODECT,
+    MVDECT,
     RECORD,
     MOCORD,
     NODECT
@@ -224,6 +225,13 @@ protected:
   bool            enabled;            // Whether the monitor is enabled or asleep
   unsigned int    width;              // Normally the same as the camera, but not if partly rotated
   unsigned int    height;             // Normally the same as the camera, but not if partly rotated
+  
+#ifdef __arm__ 
+  unsigned int    s_width;
+  unsigned int    s_height;
+  unsigned int    numblocks;
+#endif
+
   bool            v4l_multi_buffer;
   unsigned int    v4l_captures_per_frame;
   Orientation     orientation;        // Whether the image has to be rotated at all
@@ -363,8 +371,11 @@ public:
     Rgb p_signal_check_colour,
     bool p_embed_exif,
     Purpose p_purpose,
+    unsigned int s_width,
+    unsigned int s_height,
     int p_n_zones=0,
     Zone *p_zones[]=0
+    
   );
   ~Monitor();
 
@@ -384,6 +395,21 @@ public:
   }
   inline Function GetFunction() const {
     return( function );
+  }
+  inline Purpose GetPurpose() const {
+    return( purpose );
+  }
+  inline Zone** GetZones() const {
+    return( zones );
+  }
+  inline int GetZonesNum() const {
+    return( n_zones );
+  }
+  inline int GetImageBufferCount() const {
+    return( image_buffer_count );
+  }
+  inline int GetPostEventCount() const {
+    return( post_event_count );
   }
   inline bool Enabled() {
     if ( function <= MONITOR )
@@ -410,6 +436,10 @@ public:
 
   unsigned int Width() const { return width; }
   unsigned int Height() const { return height; }
+ 
+  unsigned int S_Width() const { return s_width; }
+  unsigned int S_Height() const { return s_height; }
+
   unsigned int Colours() const;
   unsigned int SubpixelOrder() const;
     
@@ -454,7 +484,7 @@ public:
   int Capture();
   int PostCapture();
 
-  unsigned int DetectMotion( const Image &comp_image, Event::StringSet &zoneSet );
+  unsigned int DetectMotion( const Image &comp_image, Event::StringSet &zoneSet, Function function );
    // DetectBlack seems to be unused. Check it on zm_monitor.cpp for more info.
    //unsigned int DetectBlack( const Image &comp_image, Event::StringSet &zoneSet );
   bool CheckSignal( const Image *image );
@@ -476,6 +506,7 @@ public:
   static int LoadRemoteMonitors( const char *protocol, const char *host, const char*port, const char*path, Monitor **&monitors, Purpose purpose );
   static int LoadFileMonitors( const char *file, Monitor **&monitors, Purpose purpose );
 #if HAVE_LIBAVFORMAT
+  static int LoadFfmpegMonitorsHW( const char *file, Monitor **&monitors, Purpose purpose );
   static int LoadFfmpegMonitors( const char *file, Monitor **&monitors, Purpose purpose );
 #endif // HAVE_LIBAVFORMAT
   static Monitor *Load( unsigned int id, bool load_zones, Purpose purpose );
